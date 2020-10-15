@@ -1,0 +1,296 @@
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  This lambda runs remote database and filesystem backup scripts on
+  ec2 instances with 'tagKey' set to 'tagValue' according to a schedule.
+  Remote scripts are hosted in GitHub at ghOwner/ghRepo. Access to the
+  repo is granted via tokenInfo, which is the path to a GitHub API key
+  in the AWS Parameter Store.
+
+Parameters:
+
+  # General Config Parameters
+
+  App:
+    Description: >
+      The application defined or configured by this template.
+    Type: String
+
+  Env:
+    Description: >
+      This template's operating environment.
+    Type: String
+
+  Creator:
+    Description: >
+      IAM username of template launcher.
+    Type: String
+
+  # Backups Config Parameters
+  
+  tagKey:
+    Description: >
+      The tag that will select instances.
+    Type: String
+    Default: 'lib:app'
+
+  tagValue:
+    Description: >
+      The tag's value. 
+    Type: String
+  
+  DumpCronSpec:
+    Description: >
+      DB dump schedule. Time is in UTC. See
+      https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html
+    Type: String
+    Default: 17 7 * * ? *
+    AllowedPattern: '(([0-9]{1,2}|[0-9*?,-/LW#]+|[A-Z,-]{3,})( )?){6}'
+    ConstraintDescription: >
+      This has to be an _Amazon_ cron specifiction.
+
+  BackupCronSpec:
+    Description: >
+      Filesystem archive schedule. Time is in UTC. See link above.
+    Type: String
+    Default: 17 7 * * ? *
+    AllowedPattern: '(([0-9]{1,2}|[0-9*?,-/LW#]+|[A-Z,-]{3,})( )?){6}'
+    ConstraintDescription: >
+      This has to be an _Amazon_ cron specifiction.
+
+  dumpScriptPath:
+    Description: >
+      The path to the database dump script within the repo. Include the script
+      name. Do NOT start with a '/'. 
+    Type: String
+    Default: general/doctor-dumpenstein.sh
+
+  tarScriptPath:
+    Description: >
+      The path to the database dump script within the repo. Include the script
+      name. Do NOT start with a '/'. 
+    Type: String
+    Default: general/tar-and-store-v2.sh
+  
+  # GH Info
+  
+  tokenInfo:
+    Description: >
+      Parameter store path to the GitHub API access key.
+    Type: String
+    Default: /automation/remote-scripts/mshackelford-gh-token
+
+  ghOwner:
+    Description: >
+      The owner of the GitHub repository.
+    Type: String
+    Default: fsulib
+
+  ghRepo:
+    Description: >
+      The name of the GitHub repo.
+    Type: String
+    Default: aws-remote-scripts
+
+  # DB Dump  
+
+  backupBucket:
+    Description: >
+      The destination bucket for the backups and dumps.
+    Type: String
+    Default: va-backups.lib.fsu.edu
+    
+  dbList:
+    Description: >
+      A comma-delimited list of databases to dump, or 'all.' There shall be
+      no spaces in this list!
+    Type: String
+    Default: libwiki
+
+  dumpUserPath: 
+    Description: >
+      The path to an SSM parameter containing a db username with the right to dump this database.
+    Type: String
+    Default: /default/wiki/db-admin-user
+    
+  dumpUserPwPath:
+    Description: >
+      The path to an SSM parameter containing the db user's password.
+    Type: String
+    Default: /default/wiki/db-admin-pw
+    
+  dbHostIsLocal:
+    Description: >
+      Is the DB host local? If not, the template will figure out the db endpoint.
+    Type: String
+    AllowedValues:
+      - yes
+      - no
+    Default: no
+
+  # Filesystem Archive
+
+  tarPaths:
+    Description: >
+      A comma-delimited list of _full paths_ to archive. There shall be
+      no spaces in this list!
+    Type: String
+    Default: /var/www/html
+
+Resources:
+
+  DbDumpRemoteScriptRunner:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: RunRemote.run_remote_script
+      Runtime: python3.7
+      CodeUri: send_command/
+      Role: !GetAtt DbDumpRunRemoteIamRole.Arn
+      Description: !Sub 'Dumps ${tagValue}-${Env} databases and copies the dump to ${backupBucket}/${tagValue}/${Env}/dumps.'
+      MemorySize: 128
+      Timeout: 15
+      Tags:
+        "Name": !Sub "${tagValue}-${Env}-DbDump"
+        "lib:created-by": !Ref Creator
+        "lib:app": "infrastructure"
+        "lib:env": "serverless"
+      Environment:
+        Variables:
+          dumpBucket: !Ref backupBucket
+          dumpPath: !Sub ${App}/${Env}/dumps
+          dbList: !Ref dbList
+          dumpUserPath: !Ref dumpUserPath
+          dumpUserPwPath: !Ref dumpUserPwPath
+          dbHost:
+            Fn::If:
+              - DbIsLocal
+              - localhost
+              - Fn::ImportValue: !Sub ${ParentStack}-DbEndpoint
+          tagKey: !Ref tagKey
+          tagValue: !Ref tagValue
+          tokenInfo: !Ref tokenInfo
+          ghOwner: !Ref ghOwner
+          ghRepo: !Ref ghRepo
+          ghPath: !Ref dumpScriptPath
+
+  DbDumpEventSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub Invokes a database backup script on ${Env}-${tagValue}.
+      ScheduleExpression: !Sub cron(${DumpCronSpec})
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DbDumpRemoteScriptRunner.Arn
+          Id: !Sub ${tagValue}-${Env}-DbDump-Schedule
+
+  DbDumpLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt DbDumpRemoteScriptRunner.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DbDumpEventSchedule.Arn
+
+  DbDumpRunRemoteIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sts:AssumeRole'
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Path: "/lambda_roles/"
+      Policies:
+        - PolicyName: RunRemoteScriptPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:SendCommand'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  FsArchiverRemoteScriptRunner:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: RunRemote.run_remote_script
+      Runtime: python3.7
+      CodeUri: send_command_v2/
+      Role: !GetAtt FsArchiverRunRemoteIamRole.Arn
+      Description: !Sub 'Archives filesystem objects on ${tagValue}-${Env} and copies the archive to ${backupBucket}/${tagValue}/${Env}.'
+      MemorySize: 128
+      Timeout: 15
+      Tags:
+        "Name": !Sub "${tagValue}-${Env}-FsArchiver"
+        "lib:created-by": !Ref Creator
+        "lib:app": "infrastructure"
+        "lib:env": "serverless"
+      Environment:
+        Variables:
+          bucket: !Ref backupBucket
+          appEnv: !Ref Env
+          tarPaths: !Ref tarPaths
+          tagKey: !Ref tagKey
+          tagValue: !Ref tagValue
+          tokenInfo: !Ref tokenInfo
+          ghOwner: !Ref ghOwner
+          ghRepo: !Ref ghRepo
+          ghPath: !Ref tarScriptPath
+
+  FsArchiverEventSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: !Sub 'Invokes a lambda that runs a remote backup script on ${tagValue}.'
+      ScheduleExpression: !Sub cron(${BackupCronSpec})
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt FsArchiverRemoteScriptRunner.Arn
+          Id: !Sub ${tagValue}-${Env}-FsArchiver-Schedule
+
+  FsArchiverLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt FsArchiverRemoteScriptRunner.Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FsArchiverEventSchedule.Arn
+
+  FsArchiverRunRemoteIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sts:AssumeRole'
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Path: "/lambda_roles/"
+      Policies:
+        - PolicyName: RunRemoteScriptPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ssm:SendCommand'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+

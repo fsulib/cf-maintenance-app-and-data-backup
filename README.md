@@ -1,0 +1,1 @@
+A nestable CF template that creates lambdas and a schedule that perform database and filsystem backup tasks on an EC2 instance. Will need packaging before use. Packaged and nestable version for our use is known as dump-and-backup.
