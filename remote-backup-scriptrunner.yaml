@@ -118,15 +118,11 @@ Parameters:
       The path to an SSM parameter containing the db user's password.
     Type: String
     Default: /default/wiki/db-admin-pw
-    
-  dbHostIsLocal:
+
+  dbHost:
     Description: >
-      Is the DB host local? If not, the template will figure out the db endpoint.
+      The database host targeted for backups.
     Type: String
-    AllowedValues:
-      - yes
-      - no
-    Default: no
 
   # Filesystem Archive
 
@@ -161,11 +157,7 @@ Resources:
           dbList: !Ref dbList
           dumpUserPath: !Ref dumpUserPath
           dumpUserPwPath: !Ref dumpUserPwPath
-          dbHost:
-            Fn::If:
-              - DbIsLocal
-              - localhost
-              - Fn::ImportValue: !Sub ${ParentStack}-DbEndpoint
+          dbHost: !Ref dbHost
           tagKey: !Ref tagKey
           tagValue: !Ref tagValue
           tokenInfo: !Ref tokenInfo
